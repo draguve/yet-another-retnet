@@ -132,10 +132,13 @@ def train_one_epoch(
 ) -> None:
     state.current_epoch += 1
     fabric, model, optimizer = state.fabric, state.model, state.optimizer
+    is_main_process = fabric.local_rank == 0
     is_training = model.training
     model.train()
 
-    with tqdm(desc=f"Ep: {state.current_epoch}") as progbar:
+    with tqdm(
+        desc=f"Ep: {state.current_epoch}", disable=(not is_main_process)
+    ) as progbar:
         train_loss, val_loss = 0.0, 0.0
         for x, y in train_dataloader:
             state.current_step += 1
@@ -196,7 +199,7 @@ def train(
             version, _ = torch.cuda.get_device_capability()
             precision = "bf16-mixed" if version >= 8 else "16-mixed"
         else:
-            precision = "float32"
+            precision = "32-true"
 
     logger = TensorBoardLogger(root_dir="./")
     fabric = Fabric(
@@ -256,7 +259,7 @@ def generate(
     prev_states: List[Optional[Tensor]] = [None] * retnet.num_layers
     start_idx: int = 0
     for start_idx in range(0, x.size(1), prompt_chunk_size):
-        y, prev_states = retnet.forward_chunkwise(
+        y, prev_states = retnet.forward_chunkwise(  # type: ignore
             x, start_idx=start_idx, prev_states=prev_states
         )
         y = y[:, -1]
@@ -281,7 +284,7 @@ def generate(
         elif i < (max_new_tokens - 1):
             start_idx += 1
             x = torch.as_tensor([token], dtype=torch.long, device=device)
-            y, prev_states = retnet.forward_recurrent(
+            y, prev_states = retnet.forward_recurrent(  # type: ignore
                 x, start_idx, prev_states=prev_states
             )
 
@@ -315,6 +318,14 @@ def main(
         retnet.load_state_dict(ModelCheckpoint.load(model_checkpoint).state_dict)
 
     if not eval_only:
+        num_devices = torch.cuda.device_count()
+        if num_devices > 0:
+            # Lightning Fabric does not scale the batch size for distributed training.
+            # In order to keep batch size the same, divide by the number of devices.
+            if batch_size % num_devices != 0:
+                raise ValueError(f"{batch_size=} must be divisible by {num_devices=}.")
+            batch_size = batch_size // num_devices
+
         train_dataloader = DataLoader(
             project_gutenberg_top_100_datapipe(
                 split="train",

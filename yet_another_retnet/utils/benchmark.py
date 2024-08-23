@@ -36,7 +36,11 @@ def benchmark(
             "fn": fn,
             "args": args,
             "kwargs": kwargs,
-            "synchronize": torch.cuda.synchronize,
+            "synchronize": (
+                torch.cuda.synchronize
+                if torch.cuda.is_available()
+                else (lambda: None)  # type: ignore
+            ),
         },
     )
     # Run the function 5 times to warm up

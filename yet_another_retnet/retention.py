@@ -1,3 +1,4 @@
+from functools import lru_cache
 from math import log
 from typing import Callable, Literal, Optional, Tuple, Union
 
@@ -25,6 +26,7 @@ def _get_activation_fn(activation: str) -> Callable[[Tensor], Tensor]:
         )
 
 
+@lru_cache(maxsize=1)
 def _build_decay_gammas(
     num_heads: int,
     device: Optional[Union[torch.device, str]] = None,
@@ -40,13 +42,14 @@ def _build_decay_gammas(
     """
     xmin, xmax = log(1 / 32), log(1 / 512)
     x = torch.linspace(xmin, xmax, steps=num_heads, device=device, dtype=dtype)
-    return 1 - torch.exp(x)
+    return 1 - x.exp_()
 
 
+@lru_cache(maxsize=1)
 def _build_decay_mask(
+    num_heads: int,
     query_length: int,
     key_length: int,
-    decay_gammas: Tensor,
     device: Optional[Union[torch.device, str]] = None,
     dtype: Optional[torch.dtype] = None,
 ) -> Tensor:
@@ -57,39 +60,22 @@ def _build_decay_mask(
 
     See: https://arxiv.org/pdf/2307.08621v3.pdf, Equation 5
     """
-    query_pos = torch.arange(query_length, device=device, dtype=dtype)
-    key_pos = torch.arange(key_length, device=device, dtype=dtype)
+    decay_gammas = _build_decay_gammas(num_heads=num_heads, device=device, dtype=dtype)
 
-    distance = torch.abs(query_pos.unsqueeze(-1) - key_pos.unsqueeze(0))
-    # Set the upper-triangular distances to infinity, so that only *past* keys
-    # can affect the current query.  (Setting distance to infinity ensures that
-    # the decay matrix is 0 for those positions, since x^(inf) = 0 when -1 < x < 1.
-    distance_mask = torch.ones_like(distance, dtype=torch.bool).triu_(diagonal=1)
-    distance = distance.masked_fill(distance_mask, float("inf"))
+    query_pos = torch.arange(query_length, device=device, dtype=dtype).unsqueeze_(-1)
+    key_pos = torch.arange(key_length, device=device, dtype=dtype).unsqueeze_(0)
+    distance = torch.abs(query_pos - key_pos)
 
     distance = rearrange(distance, "n s -> () n s")
     decay_gammas = rearrange(decay_gammas, "h -> h () ()")
-    return decay_gammas**distance
-
-
-# def _build_chunkwise_decay_mask(
-#     chunk_size: int,
-#     decay_gammas: Tensor,
-#     device: Optional[Union[torch.device, str]] = None,
-#     dtype: Optional[torch.dtype] = None,
-# ) -> Tensor:
-#     """The chunkwise decay mask is used in the chunkwise formulation of retention.
-#     It is derived from the recurrent formulation -- we apply increasing amounts
-#     of decay to the previous state, based on the position of each token in the
-#     input chunk.  So, we add a 'sequence' dimension to the decay gammas, and
-#     raise them to the power of the position of each token in the chunk.
-
-#     See: https://arxiv.org/pdf/2307.08621v3.pdf, Equation 7
-#     """
-#     chunk_pos = torch.arange(chunk_size, device=device, dtype=dtype)
-#     chunk_pos = rearrange(chunk_pos, "n -> () n")
-#     decay_gammas = rearrange(decay_gammas, "h -> h ()")
-#     return decay_gammas**chunk_pos
+    # NOTE: Keep only the lower-triangular elements (including the diagonal), so that
+    # *future* keys cannot affect the current query. The .tril() method is not yet
+    # implemented for bfloat16 dtypes, so we use .masked_fill_() instead,
+    # which is slightly slower.
+    # Thanks to @Doraemonzzz for catching this bug!
+    decay_mask = decay_gammas**distance
+    future_mask = torch.ones_like(decay_mask, dtype=torch.bool).triu_(diagonal=1)
+    return decay_mask.masked_fill_(future_mask, 0)
 
 
 def _build_position_thetas(
@@ -127,6 +113,7 @@ def _multiply_by_i(x: Tensor) -> Tensor:
     return torch.stack((-x[..., 1::2], x[..., ::2]), dim=-1).flatten(start_dim=-2)
 
 
+@torch.jit.script
 def _theta_shift(x: Tensor, sin: Tensor, cos: Tensor) -> Tensor:
     # TODO: Add docstring
     return (x * cos) + (_multiply_by_i(x) * sin)
@@ -137,17 +124,12 @@ def retention_parallel(
     key: Tensor,
     value: Tensor,
     scale: Optional[float] = None,
-    decay_gammas: Optional[Tensor] = None,
     need_weights: bool = False,
 ) -> Tuple[Tensor, Optional[Tensor]]:
-    if decay_gammas is None:
-        decay_gammas = _build_decay_gammas(
-            num_heads=query.shape[1], device=query.device, dtype=query.dtype
-        )
     decay_mask = _build_decay_mask(
+        num_heads=query.shape[1],
         query_length=query.shape[2],
         key_length=key.shape[2],
-        decay_gammas=decay_gammas,
         device=query.device,
         dtype=query.dtype,
     )
@@ -177,12 +159,10 @@ def retention_recurrent(
     value: Tensor,
     prev_state: Optional[Tensor],
     scale: Optional[float] = None,
-    decay_gammas: Optional[Tensor] = None,
 ) -> Tuple[Tensor, Tensor]:
-    if decay_gammas is None:
-        decay_gammas = _build_decay_gammas(
-            num_heads=query.shape[1], device=query.device, dtype=query.dtype
-        )
+    decay_gammas = _build_decay_gammas(
+        num_heads=query.shape[1], device=query.device, dtype=query.dtype
+    )
 
     # einstein notation:
     # - b: batch_size
@@ -206,16 +186,14 @@ def retention_chunkwise(
     value: Tensor,
     prev_state: Optional[Tensor],
     scale: Optional[float] = None,
-    decay_gammas: Optional[Tensor] = None,
 ) -> Tuple[Tensor, Tensor]:
-    if decay_gammas is None:
-        decay_gammas = _build_decay_gammas(
-            num_heads=query.shape[1], device=query.device, dtype=query.dtype
-        )
+    decay_gammas = _build_decay_gammas(
+        num_heads=query.shape[1], device=query.device, dtype=query.dtype
+    )
     decay_mask = _build_decay_mask(
+        num_heads=query.shape[1],
         query_length=query.shape[2],
         key_length=key.shape[2],
-        decay_gammas=decay_gammas,
         device=query.device,
         dtype=query.dtype,
     )
@@ -240,9 +218,9 @@ def retention_chunkwise(
         torch.arange(key.size(2), device=key.device, dtype=key.dtype) + 1,
         "n -> () () n ()",
     )
-    states = einsum(key, value, "b h n d1, b h n d2 -> b h n d1 d2")
     state_decays = decay_gammas ** (key.size(2) - inner_pos)
-    state = einsum(states, state_decays, "b h n d1 d2, _ h n _ -> b h d1 d2")
+    discounted_key = einsum(key, state_decays, "b h n d, _ h n _ -> b h n d")
+    state = einsum(discounted_key, value, "b h n d1, b h n d2 -> b h d1 d2")
     if prev_state is not None:
         # Update internal state to return to the user
         chunk_decay = decay_gammas ** key.size(2)
@@ -524,17 +502,11 @@ class MultiScaleRetention(nn.Module):
         )
 
         if self.relative_position:
-            # global (cross-chunk) relative position embedding
+            # global (cross-chunk) + intra-chunk relative position embedding
             assert self.thetas is not None
-            thetas = rearrange(self.thetas, "d -> () () () d")
-            angles = start_idx * thetas
-            sin = torch.sin(angles)
-            cos = torch.cos(angles)
-            q = _theta_shift(q, sin, cos)
-            k = _theta_shift(k, sin, cos)
-
-            # intra-chunk relative position encoding
-            indices = torch.arange(q.size(2), device=q.device, dtype=q.dtype)
+            indices = torch.arange(
+                start_idx, start_idx + q.size(2), device=q.device, dtype=q.dtype
+            )
             indices = rearrange(indices, "n -> () () n ()")
             thetas = rearrange(self.thetas, "d -> () () () d")
             angles = indices * thetas
